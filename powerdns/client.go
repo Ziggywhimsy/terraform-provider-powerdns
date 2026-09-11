@@ -721,9 +721,9 @@ func (client *PowerDNSClient) DeleteZoneMetadata(ctx context.Context, zone strin
 		}
 	}()
 
-+	if resp.StatusCode != http.StatusNoContent &&
-+		resp.StatusCode != http.StatusOK &&
-+		resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusNoContent &&
+		resp.StatusCode != http.StatusOK &&
+		resp.StatusCode != http.StatusNotFound {
 		errorResp := new(errorResponse)
 		if err = json.NewDecoder(resp.Body).Decode(errorResp); err != nil {
 			return fmt.Errorf("error deleting zone metadata: %s (%s)", zone, kind)
