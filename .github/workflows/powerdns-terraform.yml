@@ -1,0 +1,140 @@
+name: PowerDNS + Terraform Integration
+
+on:
+  push:
+    branches: [ main, master, "fix/**" ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  powerdns-terraform:
+    name: Start PowerDNS -> Terraform apply/destroy -> Stop PowerDNS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: "[powerdns] Start PowerDNS 4.8"
+        run: |
+          docker run -d --name pdns \
+            -p 8081:8081 \
+            -e PDNS_AUTH_API_KEY=changeme \
+            powerdns/pdns-auth-48:latest \
+            --api=yes --api-key=changeme --webserver=yes \
+            --webserver-address=0.0.0.0 --webserver-allow-from=0.0.0.0/0 \
+            --launch=gsqlite3 --gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+
+      - name: "[powerdns] Wait for PowerDNS to be ready"
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -H "X-API-Key: changeme" http://localhost:8081/api/v1/servers/localhost > /dev/null; then
+              echo "PowerDNS is up"
+              exit 0
+            fi
+            echo "Waiting for PowerDNS... ($i)"
+            sleep 2
+          done
+          echo "PowerDNS did not become ready in time"
+          docker logs pdns
+          exit 1
+
+      - name: "[powerdns] Show server info"
+        run: |
+          curl -s -H "X-API-Key: changeme" http://localhost:8081/api/v1/servers/localhost | tee pdns-server-info.json
+
+      - name: "[terraform] Build provider binary for dev override"
+        run: |
+          mkdir -p dist
+          go build -o dist/terraform-provider-powerdns .
+
+      - name: "[terraform] Set up Terraform CLI"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: "[terraform] Configure dev_overrides"
+        run: |
+          cat > "$HOME/.terraformrc" <<EOF
+          provider_installation {
+            dev_overrides {
+              "mmianl/powerdns" = "${{ github.workspace }}/dist"
+            }
+            direct {}
+          }
+          EOF
+          cat "$HOME/.terraformrc"
+
+      - name: "[terraform] Write test config"
+        run: |
+          mkdir -p tf-test
+          cat > tf-test/main.tf <<'EOF'
+          terraform {
+            required_providers {
+              powerdns = {
+                source = "mmianl/powerdns"
+              }
+            }
+          }
+
+          provider "powerdns" {
+            server_url = "http://127.0.0.1:8081"
+            api_key    = "changeme"
+          }
+
+          resource "powerdns_zone" "example" {
+            name = "example.test."
+            kind = "Master"
+          }
+
+          resource "powerdns_zone_metadata" "also_notify" {
+            zone     = powerdns_zone.example.name
+            kind     = "ALSO-NOTIFY"
+            metadata = ["192.0.2.1"]
+          }
+          EOF
+
+      - name: "[terraform] init"
+        working-directory: tf-test
+        run: terraform init | tee ../tf-init.log
+
+      - name: "[terraform] apply"
+        working-directory: tf-test
+        run: terraform apply -auto-approve | tee ../tf-apply.log
+
+      - name: "[terraform] show state after apply"
+        working-directory: tf-test
+        run: terraform show | tee ../tf-show.log
+
+      - name: "[terraform] destroy"
+        working-directory: tf-test
+        run: terraform destroy -auto-approve | tee ../tf-destroy.log
+
+      - name: "[stop] Dump PowerDNS logs"
+        if: always()
+        run: docker logs pdns > pdns-container.log 2>&1 || true
+
+      - name: "[stop] Stop and remove PowerDNS container"
+        if: always()
+        run: docker rm -f pdns || true
+
+      - name: Upload full output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: powerdns-terraform-output
+          path: |
+            pdns-server-info.json
+            pdns-container.log
+            tf-init.log
+            tf-apply.log
+            tf-show.log
+            tf-destroy.log
+          if-no-files-found: warn
