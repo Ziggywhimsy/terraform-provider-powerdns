@@ -46,7 +46,7 @@ jobs:
       - name: Start PowerDNS 4.8
         run: |
           docker run -d --name pdns \
-            -p 8081:8081 -p 53:53/udp -p 53:53/tcp \
+            -p 8081:8081 \
             -e PDNS_AUTH_API_KEY=changeme \
             powerdns/pdns-auth-48:latest \
             --api=yes --api-key=changeme --webserver=yes \
