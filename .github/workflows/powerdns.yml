@@ -68,7 +68,8 @@ jobs:
           exit 1
 
       - name: Show PowerDNS server info
-        run: curl -s -H "X-API-Key: changeme" http://localhost:8081/api/v1/servers/localhost | tee pdns-server-info.json
+        run: |
+          curl -s -H "X-API-Key: changeme" http://localhost:8081/api/v1/servers/localhost | tee pdns-server-info.json
 
       - name: Manual sanity check - create zone, add metadata, delete metadata
         run: |
