@@ -1,0 +1,112 @@
+name: PowerDNS Integration
+
+on:
+  push:
+    branches: [ main, master, "fix/**" ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  test-with-powerdns:
+    name: Build, unit test & PowerDNS acceptance test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting (excluding vendor)
+        run: |
+          fmt_out=$(gofmt -l $(find . -type f -name '*.go' -not -path './vendor/*'))
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt'ed:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Unit tests
+        run: go test ./... -v
+
+      - name: Start PowerDNS 4.8
+        run: |
+          docker run -d --name pdns \
+            -p 8081:8081 -p 53:53/udp -p 53:53/tcp \
+            -e PDNS_AUTH_API_KEY=changeme \
+            powerdns/pdns-auth-48:latest \
+            --api=yes --api-key=changeme --webserver=yes \
+            --webserver-address=0.0.0.0 --webserver-allow-from=0.0.0.0/0 \
+            --launch=gsqlite3 --gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+
+      - name: Wait for PowerDNS to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -H "X-API-Key: changeme" http://localhost:8081/api/v1/servers/localhost > /dev/null; then
+              echo "PowerDNS is up"
+              exit 0
+            fi
+            echo "Waiting for PowerDNS... ($i)"
+            sleep 2
+          done
+          echo "PowerDNS did not become ready in time"
+          docker logs pdns
+          exit 1
+
+      - name: Show PowerDNS server info
+        run: curl -s -H "X-API-Key: changeme" http://localhost:8081/api/v1/servers/localhost | tee pdns-server-info.json
+
+      - name: Manual sanity check - create zone, add metadata, delete metadata
+        run: |
+          set -x
+          curl -sf -X POST -H "X-API-Key: changeme" -H "Content-Type: application/json" \
+            -d '{"name":"example.com.","kind":"Native","nameservers":["ns1.example.com."]}' \
+            http://localhost:8081/api/v1/servers/localhost/zones
+
+          curl -sf -X POST -H "X-API-Key: changeme" -H "Content-Type: application/json" \
+            -d '{"kind":"ALLOW-AXFR-FROM","metadata":["127.0.0.1"]}' \
+            http://localhost:8081/api/v1/servers/localhost/zones/example.com./metadata
+
+          echo "---- DELETE metadata response ----"
+          curl -sv -X DELETE -H "X-API-Key: changeme" \
+            http://localhost:8081/api/v1/servers/localhost/zones/example.com./metadata/ALLOW-AXFR-FROM 2>&1 | tee delete-metadata-response.log
+
+      - name: Run acceptance tests against PowerDNS
+        env:
+          TF_ACC: "1"
+          PDNS_API_URL: "http://localhost:8081"
+          PDNS_API_KEY: "changeme"
+        run: go test ./powerdns/... -run TestAcc -v -timeout 20m | tee acceptance-tests.log
+
+      - name: Dump PowerDNS logs (always, for debugging)
+        if: always()
+        run: docker logs pdns || true
+
+      - name: Upload full output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: powerdns-test-output
+          path: |
+            pdns-server-info.json
+            delete-metadata-response.log
+            acceptance-tests.log
+          if-no-files-found: warn
+
+      - name: Stop PowerDNS
+        if: always()
+        run: docker rm -f pdns || true
